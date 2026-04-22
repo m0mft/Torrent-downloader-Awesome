@@ -6,9 +6,8 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      magnet_link: 
-        description: 'magnet link to download'
-        required: true
+      magnet_link:
+        description: 'magnet to download'
         type: string
       upload_as:
         description: 'Artifact name (optional, defaults to auto-generated)'
@@ -31,7 +30,7 @@ jobs:
 
       - name: Validate magnet link
         run: |
-          if [[ ! "${{ github.event.inputs.magnet_link }}" =~ ^magnet:?xt=urn:btih:4730D1DEB484298938E94DB12D957A81F450ABF5&dn=Summer%20of%2085%202020%20FRENCH%20480p%20WEB-DL%20x264-RMTeam&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce&tr=udp%3A%2F%2Fpublic.popcorn-tracker.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fexodus.desync.com%3A6969&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce&tr=udp%3A%2F%2Fglotorrents.pw%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftorrent.gresille.org%3A80%2Fannounce&tr=udp%3A%2F%2Fp4p.arenabg.com%3A1337&tr=udp%3A%2F%2Ftracker.internetwarriors.net%3A1337 ]]; then
+          if [[ ! "${{ github.event.inputs.magnet_link }}" =~ ^magnet:\? ]]; then
             echo "❌ Invalid magnet link format"
             exit 1
           fi

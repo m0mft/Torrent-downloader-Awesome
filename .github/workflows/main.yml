@@ -51,19 +51,19 @@ jobs:
             libssh2-1-dev \
             libsqlite3-dev \
             libexpat1-dev \
-            libnettle-dev \
+            nettle-dev \
             libgmp-dev
           echo "✅ Core dependencies installed"
 
       - name: Check for optional dependencies
         run: |
           echo "Checking optional dependencies..."
-          OPTIONAL_PACKAGES="libgnutls28-dev libc-ares-dev libcares-dev"
+          OPTIONAL_PACKAGES="libgnutls28-dev libc-ares-dev"
           
           for pkg in $OPTIONAL_PACKAGES; do
             if apt-cache search --names-only "^$pkg$" | grep -q .; then
               echo "✅ $pkg is available"
-              sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️  $pkg installation skipped (may not be needed)"
+              sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️  $pkg installation skipped"
             else
               echo "⚠️  $pkg not available in this repo (optional, skipping)"
             fi
@@ -72,15 +72,15 @@ jobs:
       - name: Verify all dependencies
         run: |
           echo "Verifying installed dependencies..."
-          DEPS="libxml2-dev libssl-dev libcppunit-dev zlib1g-dev libssh2-1-dev libsqlite3-dev libexpat1-dev libnettle-dev libgmp-dev"
-          
-          for dep in $DEPS; do
-            if dpkg -l | grep -q "$dep"; then
-              echo "✅ $dep: Installed"
-            else
-              echo "❌ $dep: NOT INSTALLED"
-            fi
-          done
+          echo "✅ libxml2-dev: $(dpkg -l | grep libxml2-dev | awk '{print $1}')"
+          echo "✅ libssl-dev: $(dpkg -l | grep libssl-dev | awk '{print $1}')"
+          echo "✅ libcppunit-dev: $(dpkg -l | grep libcppunit-dev | awk '{print $1}')"
+          echo "✅ zlib1g-dev: $(dpkg -l | grep zlib1g-dev | awk '{print $1}')"
+          echo "✅ libssh2-1-dev: $(dpkg -l | grep libssh2-1-dev | awk '{print $1}')"
+          echo "✅ libsqlite3-dev: $(dpkg -l | grep libsqlite3-dev | awk '{print $1}')"
+          echo "✅ libexpat1-dev: $(dpkg -l | grep libexpat1-dev | awk '{print $1}')"
+          echo "✅ nettle-dev: $(dpkg -l | grep nettle-dev | awk '{print $1}')"
+          echo "✅ libgmp-dev: $(dpkg -l | grep libgmp-dev | awk '{print $1}')"
 
       - name: Build latest aria2 from source
         run: |

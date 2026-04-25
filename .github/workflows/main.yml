@@ -23,10 +23,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install build dependencies
+      - name: Install all build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential automake autoconf libcppunit-dev libssl-dev libxml2-dev libz-dev libsqlite3-dev pkg-config curl jq git
+          sudo apt-get install -y \
+            build-essential \
+            automake \
+            autoconf \
+            autopoint \
+            libtool \
+            pkg-config \
+            libcppunit-dev \
+            libssl-dev \
+            libxml2-dev \
+            libz-dev \
+            libsqlite3-dev \
+            libcares-dev \
+            curl \
+            jq \
+            git \
+            gettext
 
       - name: Build latest aria2 from source
         run: |

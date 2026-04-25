@@ -1,4 +1,4 @@
-name: Advanced Torrent Download (qBittorrent)
+name: Ultimate Torrent Download (qBittorrent)
 
 permissions:
   contents: read
@@ -24,72 +24,90 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install qBittorrent & jq
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qbittorrent-nox jq
+          sudo apt-get install -y qbittorrent-nox jq awk
 
-      - name: Configure qBittorrent for Maximum Performance
+      - name: OS-Level Network & TCP Tuning
+        run: |
+          echo "🚀 Tuning Linux TCP buffers for high-speed transfers..."
+          sudo sysctl -w net.core.rmem_max=67108864
+          sudo sysctl -w net.core.wmem_max=67108864
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864"
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          sudo sysctl -w net.core.somaxconn=1024
+
+      - name: Configure qBittorrent for Max Parallelism (Dynamic Ports)
         run: |
           mkdir -p ~/.config/qBittorrent
           mkdir -p ./downloads
           
-          # Inject optimized settings
           cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
           [Preferences]
           WebUI\LocalHostAuth=false
           Downloads\SavePath=$(pwd)/downloads/
+          Connection\RandomPort=true
           Connection\GlobalDLLimit=0
           Connection\GlobalUPLimit=10
-          Connection\MaxTotalConnections=2000
-          Connection\MaxConnectionsPerTorrent=1000
+          Connection\MaxTotalConnections=5000
+          Connection\MaxConnectionsPerTorrent=2500
+          Connection\MaxUploads=100
           BitTorrent\Session\DHTEnabled=true
           BitTorrent\Session\PeXEnabled=true
           BitTorrent\Session\LSDEnabled=true
+          BitTorrent\Session\MaxActiveDownloads=1
+          BitTorrent\Session\MaxActiveTorrents=1
           Advanced\AnnounceToAllTrackers=true
+          Advanced\osCache=true
+          Downloads\DiskWriteCacheSize=512
           EOF
 
       - name: Start qBittorrent Daemon
         run: |
           qbittorrent-nox -d
-          echo "Waiting for WebUI to start..."
+          echo "Waiting for WebUI..."
           sleep 5
-          curl -s http://localhost:8080/api/v2/app/version || (echo "❌ WebUI failed to start" && exit 1)
-          echo "✅ qBittorrent started successfully"
+          curl -s http://localhost:8080/api/v2/app/version > /dev/null || (echo "❌ WebUI failed" && exit 1)
+          echo "✅ qBittorrent running on a dynamic port"
 
       - name: Add Torrent & Monitor Progress
         run: |
           MAGNET="${{ github.event.inputs.magnet_link }}"
-          
-          # Add the magnet link
           curl -s -X POST -d "urls=$MAGNET" http://localhost:8080/api/v2/torrents/add
-          echo "Torrent added. Waiting for metadata and downloading..."
+          echo "Torrent added. Fetching swarm data..."
           
-          # Polling loop to check download progress
           while true; do
             INFO=$(curl -s http://localhost:8080/api/v2/torrents/info)
             
-            # If no torrent is found yet, loop again
             if [ "$INFO" == "[]" ]; then
               echo "Waiting for metadata..."
               sleep 5
               continue
             fi
             
-            PROGRESS=$(echo "$INFO" | jq -r '.[0].progress')
+            # Extract metrics using jq
             STATE=$(echo "$INFO" | jq -r '.[0].state')
-            NAME=$(echo "$INFO" | jq -r '.[0].name')
+            PROGRESS=$(echo "$INFO" | jq -r '.[0].progress')
+            DLSPEED=$(echo "$INFO" | jq -r '.[0].dlspeed')
+            SEEDS=$(echo "$INFO" | jq -r '.[0].num_seeds')
+            TOTAL_SEEDS=$(echo "$INFO" | jq -r '.[0].num_complete')
+            PEERS=$(echo "$INFO" | jq -r '.[0].num_leechs')
             
-            # Convert progress to percentage
-            PERCENT=$(awk -v p="$PROGRESS" 'BEGIN { printf "%.2f", p * 100 }')
-            echo "Status: $STATE | Progress: $PERCENT% | Name: $NAME"
+            # Math conversions
+            PERCENT=$(awk -v p="$PROGRESS" 'BEGIN { printf "%.1f", p * 100 }')
+            SPEED_MB=$(awk -v s="$DLSPEED" 'BEGIN { printf "%.2f", s / 1048576 }')
+            
+            # Clear previous line and print new log (creates a clean updating effect in regular terminals, streams cleanly in GH actions)
+            echo "Status: $STATE | Progress: $PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS/$TOTAL_SEEDS | Connected Peers: $PEERS"
             
             if [[ "$PROGRESS" == "1" || "$STATE" == "pausedUP" || "$STATE" == "stalledUP" || "$STATE" == "uploading" ]]; then
               echo "✅ Download complete!"
               break
             fi
             
-            sleep 10
+            sleep 5
           done
 
       - name: Kill qBittorrent
@@ -98,24 +116,14 @@ jobs:
       - name: Compress Files
         run: |
           if [ -z "$(ls -A ./downloads)" ]; then
-            echo "❌ Download failed or no files found"
+            echo "❌ Download failed"
             exit 1
           fi
-          echo "📦 Compressing files..."
           tar -czf download-archive.tar.gz -C ./downloads .
-
-      - name: Generate artifact name
-        id: artifact_name
-        run: |
-          if [ -z "${{ github.event.inputs.upload_as }}" ]; then
-            echo "name=qbit-download-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
-          else
-            echo "name=${{ github.event.inputs.upload_as }}" >> $GITHUB_OUTPUT
-          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.artifact_name.outputs.name }}
+          name: ${{ github.event.inputs.upload_as || format('qbit-dl-{0}', github.run_id) }}
           path: download-archive.tar.gz
           retention-days: 7

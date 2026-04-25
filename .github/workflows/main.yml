@@ -1,129 +1,126 @@
 name: Ultimate Torrent Download (qBittorrent)
 
-permissions:
-  contents: read
-
 on:
   workflow_dispatch:
     inputs:
-      magnet_link:
-        description: 'Magnet link to download'
+      torrent_url:
+        description: 'Direct Torrent Link or Magnet Link'
         required: true
-        type: string
-      upload_as:
-        description: 'Artifact name (optional)'
-        required: false
         type: string
 
 jobs:
-  downloader:
+  download:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: OS Network Tuning (Max Performance)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qbittorrent-nox jq
-
-      - name: OS-Level Network & TCP Tuning
-        run: |
-          echo "🚀 Tuning Linux TCP buffers for high-speed transfers..."
           sudo sysctl -w net.core.rmem_max=67108864
           sudo sysctl -w net.core.wmem_max=67108864
           sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
           sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864"
+          sudo sysctl -w net.core.netdev_max_backlog=250000
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
-          sudo sysctl -w net.core.somaxconn=1024
+          sudo sysctl -w net.core.somaxconn=4096
 
-      - name: Configure qBittorrent for Max Parallelism (Dynamic Ports)
+      - name: Install qBittorrent-nox and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qbittorrent-nox jq
+
+      - name: Configure qBittorrent (Fix Save Path & Aggressive Settings)
         run: |
           mkdir -p ~/.config/qBittorrent
-          mkdir -p ./downloads
+          mkdir -p ${{ github.workspace }}/downloads
           
           cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
+          [BitTorrent]
+          Session\DefaultSavePath=${{ github.workspace }}/downloads
+          Session\MaxTotalConnections=5000
+          Session\MaxConnectionsPerTorrent=2500
+          Session\MaxUploads=10
+          Session\MaxUploadsPerTorrent=10
+          Session\MaxActiveDownloads=1
+          Session\MaxActiveTorrents=1
+          Session\GlobalMaxSeedingMinutes=1
+          Session\QueueingSystemEnabled=false
+          
+          [Network]
+          PortForwardingEnabled=false
+          PortRangeMin=6881
+          PortRangeMax=6889
+          
           [Preferences]
-          WebUI\LocalHostAuth=false
-          Downloads\SavePath=$(pwd)/downloads/
-          Connection\RandomPort=true
-          Connection\GlobalDLLimit=0
-          Connection\GlobalUPLimit=10
-          Connection\MaxTotalConnections=5000
-          Connection\MaxConnectionsPerTorrent=2500
-          Connection\MaxUploads=100
-          BitTorrent\Session\DHTEnabled=true
-          BitTorrent\Session\PeXEnabled=true
-          BitTorrent\Session\LSDEnabled=true
-          BitTorrent\Session\MaxActiveDownloads=1
-          BitTorrent\Session\MaxActiveTorrents=1
-          Advanced\AnnounceToAllTrackers=true
-          Advanced\osCache=true
+          Connection\GlobalDLLimitAlt=0
+          Connection\GlobalUPLimitAlt=0
           Downloads\DiskWriteCacheSize=512
+          Bittorrent\DHT=true
+          Bittorrent\PeX=true
+          Bittorrent\LSD=true
+          
+          [LegalNotice]
+          Accepted=true
           EOF
 
-      - name: Start qBittorrent Daemon
+      - name: Start qBittorrent and Add Torrent
         run: |
+          # Start daemon
           qbittorrent-nox -d
-          echo "Waiting for WebUI..."
-          sleep 5
-          curl -s http://localhost:8080/api/v2/app/version > /dev/null || (echo "❌ WebUI failed" && exit 1)
-          echo "✅ qBittorrent running on a dynamic port"
-
-      - name: Add Torrent & Monitor Progress
-        run: |
-          MAGNET="${{ github.event.inputs.magnet_link }}"
-          curl -s -X POST -d "urls=$MAGNET" http://localhost:8080/api/v2/torrents/add
-          echo "Torrent added. Fetching swarm data..."
+          sleep 5 # Wait for daemon to initialize
           
+          # Add torrent via Web API (Default port 8080, bypass auth for localhost by default in nox)
+          curl -s -X POST -d "urls=${{ github.event.inputs.torrent_url }}" http://localhost:8080/api/v2/torrents/add
+          
+          echo "Torrent added. Waiting for metadata..."
+          sleep 5
+
+      - name: Monitor Download Progress
+        run: |
+          echo "Monitoring qBittorrent API..."
           while true; do
-            INFO=$(curl -s http://localhost:8080/api/v2/torrents/info)
+            # Fetch torrent info
+            RESPONSE=$(curl -s http://localhost:8080/api/v2/torrents/info)
             
-            if [ "$INFO" == "[]" ]; then
-              echo "Waiting for metadata..."
+            # Check if empty (torrent not registered yet)
+            if [ "$RESPONSE" = "[]" ] || [ -z "$RESPONSE" ]; then
+              echo "Waiting for torrent to register..."
               sleep 5
               continue
             fi
             
             # Extract metrics using jq
-            STATE=$(echo "$INFO" | jq -r '.[0].state')
-            PROGRESS=$(echo "$INFO" | jq -r '.[0].progress')
-            DLSPEED=$(echo "$INFO" | jq -r '.[0].dlspeed')
-            SEEDS=$(echo "$INFO" | jq -r '.[0].num_seeds')
-            TOTAL_SEEDS=$(echo "$INFO" | jq -r '.[0].num_complete')
-            PEERS=$(echo "$INFO" | jq -r '.[0].num_leechs')
+            PROGRESS=$(echo $RESPONSE | jq -r '.[0].progress // 0')
+            STATE=$(echo $RESPONSE | jq -r '.[0].state // "unknown"')
+            DLSPEED=$(echo $RESPONSE | jq -r '.[0].dlspeed // 0')
+            SEEDS=$(echo $RESPONSE | jq -r '.[0].num_seeds // 0')
+            PEERS=$(echo $RESPONSE | jq -r '.[0].num_leechs // 0')
             
-            # Math conversions
-            PERCENT=$(awk -v p="$PROGRESS" 'BEGIN { printf "%.1f", p * 100 }')
-            SPEED_MB=$(awk -v s="$DLSPEED" 'BEGIN { printf "%.2f", s / 1048576 }')
+            # Convert speed from bytes/s to MB/s
+            SPEED_MB=$(echo "scale=2; $DLSPEED / 1048576" | bc)
+            PERCENT=$(echo "scale=2; $PROGRESS * 100" | bc)
             
-            # Clear previous line and print new log (creates a clean updating effect in regular terminals, streams cleanly in GH actions)
-            echo "Status: $STATE | Progress: $PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS/$TOTAL_SEEDS | Connected Peers: $PEERS"
+            echo "Status: $STATE | Progress: $PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS | Peers: $PEERS"
             
-            if [[ "$PROGRESS" == "1" || "$STATE" == "pausedUP" || "$STATE" == "stalledUP" || "$STATE" == "uploading" ]]; then
-              echo "✅ Download complete!"
+            if [ "$STATE" = "pausedUP" ] || [ "$STATE" = "uploading" ] || [ "$STATE" = "stalledUP" ] || [ $(echo "$PROGRESS == 1" | bc) -eq 1 ]; then
+              echo "✅ Download Complete!"
               break
             fi
             
-            sleep 5
+            sleep 10
           done
 
-      - name: Kill qBittorrent
-        run: pkill qbittorrent-nox || true
-
-      - name: Compress Files
+      - name: Compress Downloaded Files
         run: |
-          if [ -z "$(ls -A ./downloads)" ]; then
-            echo "❌ Download failed"
-            exit 1
-          fi
-          tar -czf download-archive.tar.gz -C ./downloads .
+          echo "Compressing files from ${{ github.workspace }}/downloads..."
+          cd ${{ github.workspace }}/downloads
+          tar -czf ${{ github.workspace }}/download-archive.tar.gz ./*
+          echo "Compression complete."
 
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.upload_as || format('qbit-dl-{0}', github.run_id) }}
-          path: download-archive.tar.gz
-          retention-days: 7
+          name: Torrent-Download
+          path: ${{ github.workspace }}/download-archive.tar.gz

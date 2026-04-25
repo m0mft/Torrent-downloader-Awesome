@@ -1,4 +1,4 @@
-name: Advanced Torrent Download - Optimized
+name: Advanced Torrent Download - Latest aria2
 
 permissions:
   contents: read
@@ -23,16 +23,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Check aria2c version and options
-        run: |
-          aria2c --version
-          echo "===== Available BT options ====="
-          aria2c -h | grep -i "bt-" | head -20
-
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 curl jq
+          sudo apt-get install -y build-essential automake autoconf libcppunit-dev libssl-dev libxml2-dev libz-dev libsqlite3-dev pkg-config curl jq git
+
+      - name: Build latest aria2 from source
+        run: |
+          cd /tmp
+          git clone https://github.com/aria2/aria2.git
+          cd aria2
+          autoreconf -i
+          ./configure --prefix=/usr/local \
+            --with-libcares \
+            --with-openssl \
+            --with-sqlite3 \
+            --with-zlib
+          make -j$(nproc)
+          sudo make install
+          /usr/local/bin/aria2c --version
 
       - name: Validate magnet link
         run: |
@@ -45,19 +54,20 @@ jobs:
       - name: Create download directory
         run: mkdir -p ./downloads
 
-      - name: Download torrent - OPTIMIZED SPEED
+      - name: Download torrent - MAXIMUM SPEED OPTIMIZED
         run: |
           cd ./downloads
-          aria2c \
+          /usr/local/bin/aria2c \
             --max-concurrent-downloads=1 \
-            --split=64 \
-            --min-split-size=512K \
-            --max-connection-per-server=64 \
+            --split=32 \
+            --min-split-size=5M \
+            --max-connection-per-server=32 \
             --max-tries=5 \
             --retry-wait=1 \
             --seed-time=0 \
             --seed-ratio=0 \
-            --bt-max-peers=512 \
+            --bt-max-peers=256 \
+            --bt-max-open-connections=256 \
             --dht-listen-port=6881-6889 \
             --listen-port=6881-6889 \
             --timeout=300 \

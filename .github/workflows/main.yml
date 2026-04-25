@@ -1,18 +1,24 @@
-name: Ultimate Torrent Download (qBittorrent)
+name: Advanced Torrent Download (qBittorrent)
 
 on:
   workflow_dispatch:
     inputs:
       magnet_link:
-        description: 'Magnet Link or Torrent URL'
+        description: 'Magnet Link to download'
         required: true
         type: string
+      free_disk_space:
+        description: 'Free up runner disk space (~30GB) before downloading'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   download:
     runs-on: ubuntu-latest
     steps:
-      - name: Free Disk Space
+      - name: Free Disk Space (Optional)
+        if: ${{ inputs.free_disk_space == true }}
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -23,51 +29,45 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Tune OS Network Settings for High Throughput
+      - name: OS-Level Network Tuning
         run: |
-          sudo sysctl -w net.core.rmem_max=67108864
-          sudo sysctl -w net.core.wmem_max=67108864
-          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
-          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864"
-          sudo sysctl -w net.core.netdev_max_backlog=250000
-          sudo sysctl -w net.core.somaxconn=1024
+          sudo sysctl -w net.core.rmem_max=2500000
+          sudo sysctl -w net.core.wmem_max=2500000
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 2500000"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 2500000"
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
 
-      - name: Install qBittorrent & Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qbittorrent-nox jq curl tar
+          sudo apt-get install -y qbittorrent-nox jq
 
       - name: Configure and Start qBittorrent
         run: |
-          # Create config directory
           mkdir -p ~/.config/qBittorrent
           mkdir -p ${{ github.workspace }}/downloads
 
-          # Inject aggressive config and bypass Localhost Auth
           cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
-          [Preferences]
+          [BitTorrent]
           Session\DefaultSavePath=${{ github.workspace }}/downloads
-          Connection\RandomPort=true
-          WebUI\Port=8080
-          WebUI\LocalHostAuth=false
-          WebUI\AuthSubnetWhitelistEnabled=true
-          WebUI\AuthSubnetWhitelist=127.0.0.1/32
-          BitTorrent\MaxConnections=5000
-          BitTorrent\MaxConnectionsPerTorrent=2500
-          BitTorrent\MaxUploads=100
-          Queueing\MaxActiveDownloads=1
-          Queueing\MaxActiveTorrents=1
-          BitTorrent\Session\DHTEnabled=true
-          BitTorrent\Session\PeXEnabled=true
-          BitTorrent\Session\LSDEnabled=true
-          EOF
+          Session\PortForwardingEnabled=true
+          Session\MaxActiveDownloads=-1
+          Session\MaxActiveTorrents=-1
+          Session\GlobalMaxSeedingMinutes=1
           
-          # Start daemon
+          [Connection]
+          RandomPort=true
+          
+          [Network]
+          Cookies=@Invalid()
+          
+          [Preferences]
+          WebUI\LocalHostAuth=false
+          EOF
+
           qbittorrent-nox -d
           
-          # Wait for API to become accessible
-          echo "Waiting for qBittorrent daemon to start..."
+          echo "Waiting for qBittorrent Web API to start..."
           until curl -s http://127.0.0.1:8080/api/v2/app/webapiVersion > /dev/null; do
             sleep 1
           done
@@ -75,45 +75,45 @@ jobs:
 
       - name: Download Torrent
         run: |
-          # Add the torrent via API
-          curl -s -X POST -F "urls=${{ github.event.inputs.magnet_link }}" http://127.0.0.1:8080/api/v2/torrents/add
+          # Add the torrent via API and FORCE the savepath
+          curl -s -X POST \
+            -F "urls=${{ inputs.magnet_link }}" \
+            -F "savepath=${{ github.workspace }}/downloads" \
+            http://127.0.0.1:8080/api/v2/torrents/add
           
           echo "Monitoring download..."
-          sleep 5 # Give qBittorrent time to process the magnet link metadata
+          sleep 5
           
           while true; do
-            # Fetch torrent info
             RESPONSE=$(curl -s http://127.0.0.1:8080/api/v2/torrents/info)
             
-            # Safeguard: Check if response is valid JSON
+            # Check if response is valid JSON
             if ! echo "$RESPONSE" | jq . >/dev/null 2>&1; then
-               echo "Waiting for valid API response..."
                sleep 2
                continue
             fi
 
-            # Extract metrics
             STATE=$(echo "$RESPONSE" | jq -r '.[0].state')
             PROGRESS=$(echo "$RESPONSE" | jq -r '.[0].progress')
             DLSPEED=$(echo "$RESPONSE" | jq -r '.[0].dlspeed')
             SEEDS=$(echo "$RESPONSE" | jq -r '.[0].num_seeds')
+            TOTAL_SEEDS=$(echo "$RESPONSE" | jq -r '.[0].num_complete')
             PEERS=$(echo "$RESPONSE" | jq -r '.[0].num_leechs')
             
-            # Handle empty state (magnet metadata still resolving)
             if [ "$STATE" == "null" ] || [ -z "$STATE" ]; then
-               echo "Resolving Magnet Link..."
                sleep 3
                continue
             fi
 
-            # Format progress and speed
             PROG_PERCENT=$(awk "BEGIN {printf \"%.2f\", $PROGRESS * 100}")
             SPEED_MB=$(awk "BEGIN {printf \"%.2f\", $DLSPEED / 1048576}")
             
-            echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS | Peers: $PEERS"
+            echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS/$TOTAL_SEEDS | Peers: $PEERS"
             
             if [[ "$STATE" == "pausedUP" || "$STATE" == "stalledUP" || "$STATE" == "uploading" || "$PROG_PERCENT" == "100.00" ]]; then
               echo "Download Completed!"
+              # Give qBittorrent time to flush files to disk
+              sleep 10 
               break
             fi
             
@@ -121,15 +121,19 @@ jobs:
           done
 
       - name: Stop qBittorrent
-        run: killall qbittorrent-nox
+        run: |
+          # Gracefully ask it to stop and wait for it to exit
+          pkill qbittorrent-nox
+          sleep 5
 
       - name: Compress Downloaded Files (tar.gz)
         run: |
-          cd ${{ github.workspace }}/downloads
-          tar -czvf ${{ github.workspace }}/downloaded_files.tar.gz ./*
+          # Use -C to change directory safely without using wildcards
+          tar -czvf ${{ github.workspace }}/downloaded_files.tar.gz -C ${{ github.workspace }}/downloads .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Downloaded-Files
+          name: downloaded-torrent-archive
           path: ${{ github.workspace }}/downloaded_files.tar.gz
+          if-no-files-found: error

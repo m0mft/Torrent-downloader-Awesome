@@ -1,4 +1,4 @@
-name: Advanced Torrent Download - Latest aria2
+name: Advanced Torrent Download - Latest aria2 (Full Check)
 
 permissions:
   contents: read
@@ -23,41 +23,101 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install all build dependencies
+      - name: Update package index
         run: |
           sudo apt-get update
+          echo "✅ Package index updated"
+
+      - name: Install build essentials
+        run: |
           sudo apt-get install -y \
             build-essential \
+            pkg-config \
+            git \
             automake \
             autoconf \
             autopoint \
             libtool \
-            pkg-config \
-            libcppunit-dev \
-            libssl-dev \
-            libxml2-dev \
-            libz-dev \
-            libsqlite3-dev \
-            libcares-dev \
-            curl \
-            jq \
-            git \
             gettext
+          echo "✅ Build essentials installed"
+
+      - name: Install core dependencies
+        run: |
+          sudo apt-get install -y \
+            libxml2-dev \
+            libssl-dev \
+            libcppunit-dev \
+            zlib1g-dev \
+            libssh2-1-dev \
+            libsqlite3-dev \
+            libexpat1-dev \
+            libnettle-dev \
+            libgmp-dev
+          echo "✅ Core dependencies installed"
+
+      - name: Check for optional dependencies
+        run: |
+          echo "Checking optional dependencies..."
+          OPTIONAL_PACKAGES="libgnutls28-dev libc-ares-dev libcares-dev"
+          
+          for pkg in $OPTIONAL_PACKAGES; do
+            if apt-cache search --names-only "^$pkg$" | grep -q .; then
+              echo "✅ $pkg is available"
+              sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️  $pkg installation skipped (may not be needed)"
+            else
+              echo "⚠️  $pkg not available in this repo (optional, skipping)"
+            fi
+          done
+
+      - name: Verify all dependencies
+        run: |
+          echo "Verifying installed dependencies..."
+          DEPS="libxml2-dev libssl-dev libcppunit-dev zlib1g-dev libssh2-1-dev libsqlite3-dev libexpat1-dev libnettle-dev libgmp-dev"
+          
+          for dep in $DEPS; do
+            if dpkg -l | grep -q "$dep"; then
+              echo "✅ $dep: Installed"
+            else
+              echo "❌ $dep: NOT INSTALLED"
+            fi
+          done
 
       - name: Build latest aria2 from source
         run: |
+          echo "🔨 Building aria2 from source..."
           cd /tmp
+          
+          if [ -d aria2 ]; then
+            rm -rf aria2
+          fi
+          
           git clone https://github.com/aria2/aria2.git
           cd aria2
+          
+          echo "Running autoreconf..."
           autoreconf -i
-          ./configure --prefix=/usr/local \
-            --with-libcares \
+          
+          echo "Running configure..."
+          ./configure \
+            --prefix=/usr/local \
             --with-openssl \
             --with-sqlite3 \
-            --with-zlib
+            --with-zlib \
+            --with-libexpat \
+            --with-libcppunit \
+            --enable-bittorrent \
+            --enable-metalink \
+            --enable-ssl
+          
+          echo "Compiling (using $(nproc) cores)..."
           make -j$(nproc)
+          
+          echo "Installing..."
           sudo make install
+          
+          echo "✅ aria2 successfully built and installed"
           /usr/local/bin/aria2c --version
+          /usr/local/bin/aria2c -h | head -20
 
       - name: Validate magnet link
         run: |
@@ -73,6 +133,7 @@ jobs:
       - name: Download torrent - MAXIMUM SPEED OPTIMIZED
         run: |
           cd ./downloads
+          echo "Starting download with optimized settings..."
           /usr/local/bin/aria2c \
             --max-concurrent-downloads=1 \
             --split=32 \

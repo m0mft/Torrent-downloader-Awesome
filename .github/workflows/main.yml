@@ -1,4 +1,4 @@
-name: Advanced Torrent Download - Latest aria2 (Full Check)
+name: Advanced Torrent Download (qBittorrent)
 
 permissions:
   contents: read
@@ -7,10 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       magnet_link:
-        description: 'magnet to download'
+        description: 'Magnet link to download'
+        required: true
         type: string
       upload_as:
-        description: 'Artifact name (optional, defaults to auto-generated)'
+        description: 'Artifact name (optional)'
         required: false
         type: string
 
@@ -21,170 +22,100 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Update package index
+      - name: Install qBittorrent & jq
         run: |
           sudo apt-get update
-          echo "✅ Package index updated"
+          sudo apt-get install -y qbittorrent-nox jq
 
-      - name: Install build essentials
+      - name: Configure qBittorrent for Maximum Performance
         run: |
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            git \
-            automake \
-            autoconf \
-            autopoint \
-            libtool \
-            gettext
-          echo "✅ Build essentials installed"
-
-      - name: Install core dependencies
-        run: |
-          sudo apt-get install -y \
-            libxml2-dev \
-            libssl-dev \
-            libcppunit-dev \
-            zlib1g-dev \
-            libssh2-1-dev \
-            libsqlite3-dev \
-            libexpat1-dev \
-            nettle-dev \
-            libgmp-dev
-          echo "✅ Core dependencies installed"
-
-      - name: Check for optional dependencies
-        run: |
-          echo "Checking optional dependencies..."
-          OPTIONAL_PACKAGES="libgnutls28-dev libc-ares-dev"
+          mkdir -p ~/.config/qBittorrent
+          mkdir -p ./downloads
           
-          for pkg in $OPTIONAL_PACKAGES; do
-            if apt-cache search --names-only "^$pkg$" | grep -q .; then
-              echo "✅ $pkg is available"
-              sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️  $pkg installation skipped"
-            else
-              echo "⚠️  $pkg not available in this repo (optional, skipping)"
+          # Inject optimized settings
+          cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/downloads/
+          Connection\GlobalDLLimit=0
+          Connection\GlobalUPLimit=10
+          Connection\MaxTotalConnections=2000
+          Connection\MaxConnectionsPerTorrent=1000
+          BitTorrent\Session\DHTEnabled=true
+          BitTorrent\Session\PeXEnabled=true
+          BitTorrent\Session\LSDEnabled=true
+          Advanced\AnnounceToAllTrackers=true
+          EOF
+
+      - name: Start qBittorrent Daemon
+        run: |
+          qbittorrent-nox -d
+          echo "Waiting for WebUI to start..."
+          sleep 5
+          curl -s http://localhost:8080/api/v2/app/version || (echo "❌ WebUI failed to start" && exit 1)
+          echo "✅ qBittorrent started successfully"
+
+      - name: Add Torrent & Monitor Progress
+        run: |
+          MAGNET="${{ github.event.inputs.magnet_link }}"
+          
+          # Add the magnet link
+          curl -s -X POST -d "urls=$MAGNET" http://localhost:8080/api/v2/torrents/add
+          echo "Torrent added. Waiting for metadata and downloading..."
+          
+          # Polling loop to check download progress
+          while true; do
+            INFO=$(curl -s http://localhost:8080/api/v2/torrents/info)
+            
+            # If no torrent is found yet, loop again
+            if [ "$INFO" == "[]" ]; then
+              echo "Waiting for metadata..."
+              sleep 5
+              continue
             fi
+            
+            PROGRESS=$(echo "$INFO" | jq -r '.[0].progress')
+            STATE=$(echo "$INFO" | jq -r '.[0].state')
+            NAME=$(echo "$INFO" | jq -r '.[0].name')
+            
+            # Convert progress to percentage
+            PERCENT=$(awk -v p="$PROGRESS" 'BEGIN { printf "%.2f", p * 100 }')
+            echo "Status: $STATE | Progress: $PERCENT% | Name: $NAME"
+            
+            if [[ "$PROGRESS" == "1" || "$STATE" == "pausedUP" || "$STATE" == "stalledUP" || "$STATE" == "uploading" ]]; then
+              echo "✅ Download complete!"
+              break
+            fi
+            
+            sleep 10
           done
 
-      - name: Verify all dependencies
-        run: |
-          echo "Verifying installed dependencies..."
-          echo "✅ libxml2-dev: $(dpkg -l | grep libxml2-dev | awk '{print $1}')"
-          echo "✅ libssl-dev: $(dpkg -l | grep libssl-dev | awk '{print $1}')"
-          echo "✅ libcppunit-dev: $(dpkg -l | grep libcppunit-dev | awk '{print $1}')"
-          echo "✅ zlib1g-dev: $(dpkg -l | grep zlib1g-dev | awk '{print $1}')"
-          echo "✅ libssh2-1-dev: $(dpkg -l | grep libssh2-1-dev | awk '{print $1}')"
-          echo "✅ libsqlite3-dev: $(dpkg -l | grep libsqlite3-dev | awk '{print $1}')"
-          echo "✅ libexpat1-dev: $(dpkg -l | grep libexpat1-dev | awk '{print $1}')"
-          echo "✅ nettle-dev: $(dpkg -l | grep nettle-dev | awk '{print $1}')"
-          echo "✅ libgmp-dev: $(dpkg -l | grep libgmp-dev | awk '{print $1}')"
+      - name: Kill qBittorrent
+        run: pkill qbittorrent-nox || true
 
-      - name: Build latest aria2 from source
-        run: |
-          echo "🔨 Building aria2 from source..."
-          cd /tmp
-          
-          if [ -d aria2 ]; then
-            rm -rf aria2
-          fi
-          
-          git clone https://github.com/aria2/aria2.git
-          cd aria2
-          
-          echo "Running autoreconf..."
-          autoreconf -i
-          
-          echo "Running configure..."
-          ./configure \
-            --prefix=/usr/local \
-            --with-openssl \
-            --with-sqlite3 \
-            --with-zlib \
-            --with-libexpat \
-            --with-libcppunit \
-            --enable-bittorrent \
-            --enable-metalink \
-            --enable-ssl
-          
-          echo "Compiling (using $(nproc) cores)..."
-          make -j$(nproc)
-          
-          echo "Installing..."
-          sudo make install
-          
-          echo "✅ aria2 successfully built and installed"
-          /usr/local/bin/aria2c --version
-          /usr/local/bin/aria2c -h | head -20
-
-      - name: Validate magnet link
-        run: |
-          if [[ ! "${{ github.event.inputs.magnet_link }}" =~ ^magnet:\? ]]; then
-            echo "❌ Invalid magnet link format"
-            exit 1
-          fi
-          echo "✅ Magnet link validated"
-
-      - name: Create download directory
-        run: mkdir -p ./downloads
-
-      - name: Download torrent - MAXIMUM SPEED OPTIMIZED
-        run: |
-          cd ./downloads
-          echo "Starting download with optimized settings..."
-          /usr/local/bin/aria2c \
-            --max-concurrent-downloads=1 \
-            --split=32 \
-            --min-split-size=5M \
-            --max-connection-per-server=32 \
-            --max-tries=5 \
-            --retry-wait=1 \
-            --seed-time=0 \
-            --seed-ratio=0 \
-            --bt-max-peers=256 \
-            --bt-max-open-connections=256 \
-            --dht-listen-port=6881-6889 \
-            --listen-port=6881-6889 \
-            --timeout=300 \
-            --connect-timeout=120 \
-            --continue=true \
-            --allow-overwrite=true \
-            --auto-file-renaming=false \
-            "${{ github.event.inputs.magnet_link }}"
-        continue-on-error: true
-
-      - name: Check download status
+      - name: Compress Files
         run: |
           if [ -z "$(ls -A ./downloads)" ]; then
             echo "❌ Download failed or no files found"
             exit 1
           fi
-          echo "✅ Download completed"
-          du -sh ./downloads
-          ls -lh ./downloads
+          echo "📦 Compressing files..."
+          tar -czf download-archive.tar.gz -C ./downloads .
 
       - name: Generate artifact name
         id: artifact_name
         run: |
           if [ -z "${{ github.event.inputs.upload_as }}" ]; then
-            ARTIFACT_NAME="torrent-download-$(date +%Y%m%d-%H%M%S)"
+            echo "name=qbit-download-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
           else
-            ARTIFACT_NAME="${{ github.event.inputs.upload_as }}"
+            echo "name=${{ github.event.inputs.upload_as }}" >> $GITHUB_OUTPUT
           fi
-          echo "name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact_name.outputs.name }}
-          path: ./downloads
-
-      - name: Summary
-        run: |
-          echo "📊 Download Summary"
-          echo "===================="
-          echo "Artifact: ${{ steps.artifact_name.outputs.name }}"
-          echo "Size: $(du -sh ./downloads | cut -f1)"
-          echo "Files: $(find ./downloads -type f | wc -l)"
+          path: download-archive.tar.gz
+          retention-days: 7

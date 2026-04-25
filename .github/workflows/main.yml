@@ -59,7 +59,6 @@ jobs:
             --seed-time=0 \
             --seed-ratio=0 \
             --bt-max-peers=512 \
-            --bt-max-open-connections=512 \
             --bt-request-timeout=10 \
             --bt-enable-lpd=false \
             --dht-listen-port=6881-6889 \
@@ -68,13 +67,9 @@ jobs:
             --connect-timeout=120 \
             --lowest-speed-limit=0 \
             --speed-limit-local=0 \
-            --speed-limit-above=0 \
             --continue=true \
             --allow-overwrite=true \
             --auto-file-renaming=false \
-            --conditional-get=false \
-            --remote-time=false \
-            --check-certificate=false \
             "${{ github.event.inputs.magnet_link }}"
         continue-on-error: true
 

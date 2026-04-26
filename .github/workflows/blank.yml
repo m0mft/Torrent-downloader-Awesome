@@ -1,0 +1,200 @@
+name: qBittorrent High-Performance Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      torrent_url:
+        description: 'Magnet Link or Direct Torrent File URL'
+        required: true
+        type: string
+      free_disk_space:
+        description: 'Free up runner disk space (takes ~2 mins, use for >30GB)'
+        required: false
+        type: boolean
+        default: false
+      archive_format:
+        description: 'Compression Format'
+        required: true
+        type: choice
+        options:
+          - zip
+          - tar.gz
+          - rar
+          - none
+        default: 'zip'
+      rar_parts:
+        description: 'Number of parts to split RAR archive into (only if RAR is selected)'
+        required: false
+        type: number
+        default: 1
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        if: ${{ inputs.free_disk_space == true }}
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qbittorrent-nox jq rar zip tar curl
+
+      - name: OS Level Network Tuning
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+      - name: Configure and Start qBittorrent
+        run: |
+          mkdir -p ~/.config/qBittorrent
+          cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
+          [BitTorrent]
+          Session\MaxTotalConnections=5000
+          Session\MaxConnectionsPerTorrent=2500
+          Session\GlobalMaxSeedingMinutes=1
+          Session\AnnounceToAllTrackers=true
+          
+          [Network]
+          PortForwardingEnabled=false
+          RandomPort=true
+          
+          [Preferences]
+          Connection\GlobalDLLimitAlt=0
+          Connection\GlobalUPLimitAlt=0
+          Downloads\DiskWriteCacheSize=512
+          WebUI\LocalHostAuth=false
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32
+          EOF
+
+          qbittorrent-nox -d
+          
+          # Wait for API to be ready
+          until curl -s http://127.0.0.1:8080/api/v2/app/webapiVersion | jq . >/dev/null 2>&1; do
+            echo "Waiting for qBittorrent daemon..."
+            sleep 2
+          done
+          echo "qBittorrent started successfully."
+
+      - name: Add Torrent and Monitor Progress
+        run: |
+          mkdir -p ${{ github.workspace }}/downloads
+          
+          # Add torrent with absolute save path
+          curl -s -X POST http://127.0.0.1:8080/api/v2/torrents/add \
+            -d "urls=${{ inputs.torrent_url }}" \
+            -d "savepath=${{ github.workspace }}/downloads"
+
+          echo "Monitoring download..."
+          while : ; do
+            sleep 2
+            
+            RESPONSE=$(curl -s http://127.0.0.1:8080/api/v2/torrents/info)
+            if ! echo "$RESPONSE" | jq . >/dev/null 2>&1; then continue; fi
+            TORRENT_INFO=$(echo "$RESPONSE" | jq -r '.[0]')
+            if [ "$TORRENT_INFO" == "null" ]; then continue; fi
+            
+            NAME=$(echo "$TORRENT_INFO" | jq -r '.name')
+            STATE=$(echo "$TORRENT_INFO" | jq -r '.state')
+            PROGRESS=$(echo "$TORRENT_INFO" | jq -r '.progress')
+            DOWNLOADED=$(echo "$TORRENT_INFO" | jq -r '.downloaded')
+            TOTAL_SIZE=$(echo "$TORRENT_INFO" | jq -r '.total_size')
+            DLSPEED=$(echo "$TORRENT_INFO" | jq -r '.dlspeed')
+            SEEDS=$(echo "$TORRENT_INFO" | jq -r '.num_seeds')
+            TOTAL_SEEDS=$(echo "$TORRENT_INFO" | jq -r '.num_complete')
+            PEERS=$(echo "$TORRENT_INFO" | jq -r '.num_leechs')
+            TOTAL_PEERS=$(echo "$TORRENT_INFO" | jq -r '.num_incomplete')
+            
+            SPEED_MB=$(awk "BEGIN {printf \"%.2f\", $DLSPEED/1048576}")
+            PROG_PERCENT=$(awk "BEGIN {printf \"%.1f\", $PROGRESS * 100}")
+            DL_MB=$(awk "BEGIN {printf \"%.2f\", $DOWNLOADED/1048576}")
+            TOT_MB=$(awk "BEGIN {printf \"%.2f\", $TOTAL_SIZE/1048576}")
+            
+            BAR=""
+            FILLED=$(awk "BEGIN {printf \"%d\", $PROGRESS * 20}")
+            for ((i=0; i<20; i++)); do
+              if [ $i -lt $FILLED ]; then BAR="${BAR}#"; else BAR="${BAR}-"; fi
+            done
+            
+            printf "\r\033[KFile: %s | [%s] %s%% (%s MB / %s MB) | Speed: %s MB/s | Seeds: %s/%s | Peers: %s/%s" "${NAME:0:20}" "$BAR" "$PROG_PERCENT" "$DL_MB" "$TOT_MB" "$SPEED_MB" "$SEEDS" "$TOTAL_SEEDS" "$PEERS" "$TOTAL_PEERS"
+            
+            if [[ "$STATE" == "pausedUP" || "$STATE" == "stalledUP" || "$STATE" == "uploading" || "$PROGRESS" == "1" ]]; then
+              echo "" 
+              echo "-------------------------------------------------------------------"
+              echo "Download completed!"
+              break
+            fi
+          done
+          
+          # Disk flush buffer
+          sleep 10
+
+      - name: Archive Downloaded Files
+        id: archive
+        run: |
+          cd ${{ github.workspace }}
+          ORIGINAL_SIZE=$(du -sb downloads | cut -f1)
+          FORMAT="${{ inputs.archive_format }}"
+          PARTS="${{ inputs.rar_parts }}"
+          
+          echo "Original Size: $(awk "BEGIN {printf \"%.2f\", $ORIGINAL_SIZE/1048576}") MB"
+          
+          if [ "$FORMAT" == "zip" ]; then
+            zip -r -9 download-archive.zip downloads/
+            UPLOAD_TARGET="download-archive.zip"
+          elif [ "$FORMAT" == "tar.gz" ]; then
+            tar -czvf download-archive.tar.gz downloads/
+            UPLOAD_TARGET="download-archive.tar.gz"
+          elif [ "$FORMAT" == "rar" ]; then
+            if [ "$PARTS" -gt 1 ]; then
+              # Calculate part size: ceiling of (Total Size / Parts)
+              PART_SIZE=$(awk "BEGIN {print int(($ORIGINAL_SIZE / $PARTS) + 1)}")
+              echo "Splitting RAR into $PARTS parts of approx $PART_SIZE bytes each."
+              rar a -v${PART_SIZE}b -m3 download-archive.rar downloads/
+            else
+              rar a -m3 download-archive.rar downloads/
+            fi
+            UPLOAD_TARGET="download-archive*.rar"
+          else
+            echo "Skipping compression."
+            UPLOAD_TARGET="downloads/"
+            ARCHIVE_SIZE=$ORIGINAL_SIZE
+          fi
+          
+          if [ "$FORMAT" != "none" ]; then
+            ARCHIVE_SIZE=$(du -sc $UPLOAD_TARGET | grep total | cut -f1)
+            # Convert kb to bytes for calculation
+            ARCHIVE_SIZE=$((ARCHIVE_SIZE * 1024))
+            SAVED=$(awk "BEGIN {printf \"%.1f\", 100 - ($ARCHIVE_SIZE/$ORIGINAL_SIZE * 100)}")
+            echo "Archive Size: $(awk "BEGIN {printf \"%.2f\", $ARCHIVE_SIZE/1048576}") MB"
+            echo "Space Saved: $SAVED %"
+          fi
+          
+          echo "UPLOAD_TARGET=$UPLOAD_TARGET" >> $GITHUB_ENV
+
+      - name: Announce Upload Details
+        run: |
+          echo "Preparing to upload the following artifacts:"
+          ls -lh ${{ env.UPLOAD_TARGET }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrent-download
+          path: ${{ github.workspace }}/${{ env.UPLOAD_TARGET }}
+          if-no-files-found: error

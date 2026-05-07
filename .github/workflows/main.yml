@@ -1,18 +1,20 @@
-name: Advanced Torrent Downloader (Release)
+name: Ultimate Torrent Downloader (Web API)
+
+permissions:
+  contents: write # REQUIRED to create and upload GitHub Releases
 
 on:
   workflow_dispatch:
     inputs:
       magnet_link:
-        description: 'Magnet link (leave blank if using URL)'
+        description: 'Magnet Link (leave empty if using Torrent URL)'
         required: false
       torrent_url:
-        description: 'URL to .torrent file (leave blank if using magnet)'
+        description: 'URL to .torrent file (leave empty if using Magnet Link)'
         required: false
       compression:
-        description: 'Compression format'
+        description: 'Compression Method'
         required: true
-        default: 'none'
         type: choice
         options:
           - none
@@ -20,68 +22,125 @@ on:
           - tar
           - tar.gz
           - rar
+        default: 'rar'
       rar_split_size:
-        description: 'RAR split size (e.g., 1900M). Leave blank for no split.'
+        description: 'RAR Split Size (e.g., 1900M, 1G). Leave empty for single part.'
         required: false
-
-permissions:
-  contents: write
+        default: '1900M' # GitHub release limit is 2GB per file
+      free_disk_space:
+        description: 'Free up runner disk space (~60GB) before downloading'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
-  build:
+  download_and_release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Validate Inputs
+        run: |
+          if [ -z "${{ inputs.magnet_link }}" ] && [ -z "${{ inputs.torrent_url }}" ]; then
+            echo "::error::You must provide either a Magnet Link or a Torrent URL."
+            exit 1
+          fi
+
+      - name: Free Disk Space (Optional)
+        if: ${{ inputs.free_disk_space == true }}
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          # CRITICAL FIX: Both the daemon (nox) and the command-line interface (cli) must be installed.
-          sudo apt-get install -y qbittorrent-nox qbittorrent-cli rar
+          # Install qBittorrent daemon, jq for API parsing, and rar for compression
+          sudo apt-get install -y qbittorrent-nox jq rar
 
-      - name: Start qBittorrent
+      - name: Configure and Start qBittorrent
         run: |
-          mkdir -p downloads
-          qbittorrent-nox --daemon --webui-port=8080 --save-path=$(pwd)/downloads
+          mkdir -p ~/.config/qBittorrent
+          mkdir -p ${{ github.workspace }}/downloads
 
-      - name: Add Torrent and Wait
-        run: |
-          # Give the daemon a moment to start
-          sleep 5
+          # Configure qBittorrent via its config file
+          # This is more reliable than command-line arguments
+          cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=${{ github.workspace }}/downloads
+          [BitTorrent]
+          Session\GlobalMaxSeedingMinutes=1
+          EOF
 
-          if [ -n "${{ inputs.magnet_link }}" ]; then
-            echo "Using magnet link..."
-            qbittorrent-cli torrent add url "${{ inputs.magnet_link }}"
-          elif [ -n "${{ inputs.torrent_url }}" ]; then
-            echo "Using .torrent file URL..."
-            qbittorrent-cli torrent add url "${{ inputs.torrent_url }}"
-          else
-            echo "::error::No magnet link or torrent URL provided. Exiting."
-            exit 1
-          fi
+          # Run qBittorrent in the background (daemonize)
+          qbittorrent-nox -d
           
-          echo "Waiting for download to complete..."
+          echo "Waiting for qBittorrent Web API to become active..."
+          until curl -s http://127.0.0.1:8080/api/v2/app/webapiVersion > /dev/null; do
+            sleep 1
+          done
+          echo "qBittorrent is ready!"
+
+      - name: Add Torrent via Web API
+        run: |
+          if [ -n "${{ inputs.magnet_link }}" ]; then
+            echo "Adding magnet link..."
+            curl -s -X POST \
+              --form-string "urls=${{ inputs.magnet_link }}" \
+              --form-string "savepath=${{ github.workspace }}/downloads" \
+              http://127.0.0.1:8080/api/v2/torrents/add
+          
+          elif [ -n "${{ inputs.torrent_url }}" ]; then
+            echo "Downloading and adding .torrent file..."
+            curl -sL -o temp.torrent "${{ inputs.torrent_url }}"
+            curl -s -X POST \
+              -F "torrents=@temp.torrent" \
+              -F "savepath=${{ github.workspace }}/downloads" \
+              http://127.0.0.1:8080/api/v2/torrents/add
+          fi
+
+      - name: Monitor Download Progress via Web API
+        run: |
+          echo "Monitoring download..."
+          sleep 5 # Initial delay for torrent to be processed
+          
           while true; do
-            # Check for torrents that are not 100% complete
-            INCOMPLETE_COUNT=$(qbittorrent-cli torrent list | grep -v '100.0%' | grep -E 'downloading|stalledDL|checkingUP|checkingDL' | wc -l)
-            if [ "$INCOMPLETE_COUNT" -eq 0 ]; then
-              # Double-check to ensure at least one torrent exists before declaring success
-              TOTAL_TORRENTS=$(qbittorrent-cli torrent list | wc -l)
-              if [ "$TOTAL_TORRENTS" -gt 1 ]; then # Header row counts as 1
-                 echo "Download appears to be complete."
-                 break
-              fi
+            RESPONSE=$(curl -s http://127.0.0.1:8080/api/v2/torrents/info)
+            # Check if torrent info is available yet
+            if ! echo "$RESPONSE" | jq . >/dev/null 2>&1 || [[ "$(echo "$RESPONSE" | jq 'length')" -eq 0 ]]; then
+               echo "Waiting for torrent metadata..."
+               sleep 5
+               continue
             fi
-            echo "Still downloading... ($INCOMPLETE_COUNT torrents active). Waiting 30 seconds."
-            qbittorrent-cli torrent list # Print status for debugging
-            sleep 30
+
+            # Extract details using jq
+            STATE=$(echo "$RESPONSE" | jq -r '.[0].state')
+            PROGRESS=$(echo "$RESPONSE" | jq -r '.[0].progress')
+            DLSPEED=$(echo "$RESPONSE" | jq -r '.[0].dlspeed')
+            
+            PROG_PERCENT=$(awk "BEGIN {printf \"%.2f\", $PROGRESS * 100}")
+            SPEED_MB=$(awk "BEGIN {printf \"%.2f\", $DLSPEED / 1048576}")
+            
+            echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s"
+            
+            # Exit loop once download is finished and it enters a seeding or completed state
+            if [[ "$STATE" == "pausedUP" || "$STATE" == "uploading" || "$PROG_PERCENT" == "100.00" ]]; then
+              echo "Download Completed!"
+              break
+            fi
+            sleep 10
           done
 
       - name: Stop qBittorrent
         run: |
-          killall qbittorrent-nox
-          echo "qBittorrent stopped."
+          pkill qbittorrent-nox
+          echo "Waiting for qBittorrent to shut down..."
+          sleep 5
 
       - name: Process and Compress Files
         run: |

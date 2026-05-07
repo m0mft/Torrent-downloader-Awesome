@@ -6,21 +6,49 @@ on:
       magnet_link:
         description: 'Magnet Link or Torrent URL'
         required: true
+      compression:
+        description: 'Compression type'
+        required: true
+        default: 'rar'
+        type: choice
+        options:
+          - none
+          - zip
+          - tar
+          - tar.gz
+          - rar
+      rar_split_size:
+        description: 'RAR split size (e.g., 50m). Leave empty for single file.'
+        required: false
+        default: '1000m'
+      free_disk_space:
+        description: 'Free up disk space before downloading'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   download-and-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Required to create releases
+      contents: write
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Free Disk Space
+        if: ${{ github.event.inputs.free_disk_space == 'true' }}
+        run: |
+          echo "Freeing up disk space..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qbittorrent-nox jq curl zip
+          sudo apt-get install -y qbittorrent-nox jq curl zip tar rar unrar
 
       - name: Configure and Start qBittorrent
         run: |
@@ -52,33 +80,28 @@ jobs:
         run: |
           echo "Monitoring download..."
           while true; do
-            # Fetch torrent info using the Web API
             RESPONSE=$(curl -s http://localhost:8080/api/v2/torrents/info)
             
-            # 1. Check if the response is valid JSON. If not, wait and continue.
             if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
-               echo "Waiting for valid API response..."
                sleep 5
                continue
             fi
             
-            # 2. Extract progress, state, and name safely
             PROGRESS=$(echo "$RESPONSE" | jq -r '.[0].progress // "null"')
             STATE=$(echo "$RESPONSE" | jq -r '.[0].state // "null"')
             NAME=$(echo "$RESPONSE" | jq -r '.[0].name // "null"')
+            SPEED_BPS=$(echo "$RESPONSE" | jq -r '.[0].dlspeed // 0')
             
-            # 3. Check if progress is null (torrent might not be fully added yet or array is empty)
             if [ "$PROGRESS" == "null" ]; then
-               echo "Waiting for metadata or torrent to register..."
                sleep 5
                continue
             fi
             
-            # 4. Convert decimal progress to percentage
             PERCENT=$(awk -v p="$PROGRESS" 'BEGIN { printf "%.2f", p * 100 }')
-            echo "Downloading '$NAME': $PERCENT% (State: $STATE)"
+            SPEED_MB=$(awk -v s="$SPEED_BPS" 'BEGIN { printf "%.2f", s / 1048576 }')
             
-            # 5. Break the loop if it's 100% (progress == 1) or seeding
+            echo "Downloading '$NAME': $PERCENT% at $SPEED_MB MB/s (State: $STATE)"
+            
             if [ "$PROGRESS" == "1" ] || [[ "$STATE" == *"UP"* ]] || [[ "$STATE" == *"seeding"* ]]; then
               echo "Download complete!"
               break
@@ -89,28 +112,43 @@ jobs:
 
       - name: Compress and Prepare Upload Target
         run: |
-          set -x # Enable command tracing for debugging
-          cd ${{ github.workspace }} # Force root workspace context
+          set -x
+          cd ${{ github.workspace }}
           
-          echo "=== Auditing download directory ==="
-          ls -laR downloads/ || echo "Downloads folder is empty or missing."
+          COMPRESSION_TYPE="${{ github.event.inputs.compression }}"
+          SPLIT_SIZE="${{ github.event.inputs.rar_split_size }}"
           
-          echo "=== Compressing files ==="
-          # Hardcode a predictable, safe archive name
-          zip -r release-archive.zip downloads/
-          
-          echo "=== Verifying created archive ==="
-          ls -lh release-archive.zip
-          
-          # Pass explicit target to the release step
-          echo "UPLOAD_TARGET=release-archive.zip" >> $GITHUB_ENV
+          if [ "$COMPRESSION_TYPE" == "none" ]; then
+            echo "Skipping compression."
+            echo "UPLOAD_TARGET=downloads/*" >> $GITHUB_ENV
+            
+          elif [ "$COMPRESSION_TYPE" == "zip" ]; then
+            zip -r release-archive.zip downloads/
+            echo "UPLOAD_TARGET=release-archive.zip" >> $GITHUB_ENV
+            
+          elif [ "$COMPRESSION_TYPE" == "tar" ]; then
+            tar -cvf release-archive.tar downloads/
+            echo "UPLOAD_TARGET=release-archive.tar" >> $GITHUB_ENV
+            
+          elif [ "$COMPRESSION_TYPE" == "tar.gz" ]; then
+            tar -czvf release-archive.tar.gz downloads/
+            echo "UPLOAD_TARGET=release-archive.tar.gz" >> $GITHUB_ENV
+            
+          elif [ "$COMPRESSION_TYPE" == "rar" ]; then
+            if [ -n "$SPLIT_SIZE" ]; then
+              rar a -v${SPLIT_SIZE} release-archive.rar downloads/
+              echo "UPLOAD_TARGET=release-archive.part*.rar" >> $GITHUB_ENV
+            else
+              rar a release-archive.rar downloads/
+              echo "UPLOAD_TARGET=release-archive.rar" >> $GITHUB_ENV
+            fi
+          fi
 
       - name: Create Release and Upload
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "release-${{ github.run_id }}"
           name: "Torrent Download - Run ${{ github.run_id }}"
-          # Explicitly target the file we defined in the previous step
           files: ${{ env.UPLOAD_TARGET }} 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

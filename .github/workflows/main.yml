@@ -115,6 +115,12 @@ jobs:
           set -x
           cd ${{ github.workspace }}
           
+          # Ensure directory exists to prevent crash if download failed completely
+          mkdir -p downloads/
+          
+          # Debug: check what is actually inside
+          ls -laR downloads/
+          
           COMPRESSION_TYPE="${{ github.event.inputs.compression }}"
           SPLIT_SIZE="${{ github.event.inputs.rar_split_size }}"
           
@@ -136,13 +142,16 @@ jobs:
             
           elif [ "$COMPRESSION_TYPE" == "rar" ]; then
             if [ -n "$SPLIT_SIZE" ]; then
-              rar a -v${SPLIT_SIZE} release-archive.rar downloads/
+              # Added -r for recursive compression
+              rar a -r -v${SPLIT_SIZE} release-archive.rar downloads/
               echo "UPLOAD_TARGET=release-archive.part*.rar" >> $GITHUB_ENV
             else
-              rar a release-archive.rar downloads/
+              # Added -r for recursive compression
+              rar a -r release-archive.rar downloads/
               echo "UPLOAD_TARGET=release-archive.rar" >> $GITHUB_ENV
             fi
           fi
+
 
       - name: Create Release and Upload
         uses: softprops/action-gh-release@v2

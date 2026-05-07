@@ -56,15 +56,6 @@ jobs:
           docker-images: true
           swap-storage: true
           
-      - name: OS-Level Network Tuning
-        run: |
-          # Boost network performance for faster torrenting
-          sudo sysctl -w net.core.rmem_max=2500000
-          sudo sysctl -w net.core.wmem_max=2500000
-          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 2500000"
-          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 2500000"
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
-
 
       - name: Install Dependencies
         run: |
@@ -114,24 +105,27 @@ jobs:
             RESPONSE=$(curl -s http://127.0.0.1:8080/api/v2/torrents/info)
             if ! echo "$RESPONSE" | jq . >/dev/null 2>&1 || [[ "$(echo "$RESPONSE" | jq 'length')" -eq 0 ]]; then
                echo "Waiting for torrent metadata..."
-               sleep 5
+               sleep 3
                continue
             fi
 
             STATE=$(echo "$RESPONSE" | jq -r '.[0].state')
             PROGRESS=$(echo "$RESPONSE" | jq -r '.[0].progress')
             DLSPEED=$(echo "$RESPONSE" | jq -r '.[0].dlspeed')
+            SEEDS=$(echo "$RESPONSE" | jq -r '.[0].num_seeds')
+            PEERS=$(echo "$RESPONSE" | jq -r '.[0].num_leechs')
+
             
             PROG_PERCENT=$(awk "BEGIN {printf \"%.2f\", $PROGRESS * 100}")
             SPEED_MB=$(awk "BEGIN {printf \"%.2f\", $DLSPEED / 1048576}")
             
-            echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s"
+            echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS | Peers: $PEERS"
             
             if [[ "$STATE" == "pausedUP" || "$STATE" == "uploading" || "$PROG_PERCENT" == "100.00" ]]; then
               echo "Download Completed!"
-              break
+              sleep 10; break
             fi
-            sleep 10
+            sleep 5
           done
 
       - name: Stop qBittorrent

@@ -1,22 +1,18 @@
 name: Advanced Torrent Downloader (Release)
 
-permissions:
-  contents: write # REQUIRED to create and upload GitHub Releases
-
 on:
   workflow_dispatch:
     inputs:
       magnet_link:
-        description: 'Magnet Link (leave empty if using Torrent URL)'
+        description: 'Magnet link (leave blank if using URL)'
         required: false
-        type: string
       torrent_url:
-        description: 'URL to .torrent file (leave empty if using Magnet Link)'
+        description: 'URL to .torrent file (leave blank if using magnet)'
         required: false
-        type: string
       compression:
-        description: 'Compression Method'
+        description: 'Compression format'
         required: true
+        default: 'zip'
         type: choice
         options:
           - none
@@ -24,175 +20,107 @@ on:
           - tar
           - tar.gz
           - rar
-        default: 'tar.gz'
       rar_split_size:
-        description: 'RAR Split Size (e.g., 1900M, 1G). Leave empty for single part.'
+        description: 'RAR split size (e.g., 1900M). Leave blank for no split.'
         required: false
-        type: string
-        default: '1900M' # GitHub release limit is 2GB per file
-      free_disk_space:
-        description: 'Free up runner disk space (~30GB) before downloading'
-        required: false
-        type: boolean
-        default: false
+
+permissions:
+  contents: write
 
 jobs:
-  download:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate Inputs
-        run: |
-          if [ -z "${{ inputs.magnet_link }}" ] && [ -z "${{ inputs.torrent_url }}" ]; then
-            echo "::error::You must provide either a Magnet Link or a Torrent URL."
-            exit 1
-          fi
-
-      - name: Free Disk Space (Optional)
-        if: ${{ inputs.free_disk_space == true }}
-        uses: jlumbroso/free-disk-space@main
-        with:
-          # Free up space by removing tools and packages you don't need
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: OS-Level Network Tuning
-        run: |
-          # Boost network performance for faster torrenting
-          sudo sysctl -w net.core.rmem_max=2500000
-          sudo sysctl -w net.core.wmem_max=2500000
-          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 2500000"
-          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 2500000"
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          # Install qBittorrent, jq for API parsing, and rar for compression
-          sudo apt-get install -y qbittorrent-nox jq rar
+          sudo apt-get install -y qbittorrent-nox rar
 
-      - name: Configure and Start qBittorrent
+      - name: Start qBittorrent
         run: |
-          mkdir -p ~/.config/qBittorrent
-          mkdir -p ${{ github.workspace }}/downloads
+          mkdir -p downloads
+          qbittorrent-nox --daemon --webui-port=8080 --preferences=save_path=$(pwd)/downloads
 
-          # Configure qBittorrent to save files, disable WebUI auth, and seed for 1 minute
-          cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
-          [BitTorrent]
-          Session\DefaultSavePath=${{ github.workspace }}/downloads
-          Session\MaxActiveDownloads=-1
-          Session\MaxActiveTorrents=-1
-          Session\GlobalMaxSeedingMinutes=1
-          [Preferences]
-          WebUI\LocalHostAuth=false
-          EOF
-
-          # Run qBittorrent in the background
-          qbittorrent-nox -d
-          
-          echo "Waiting for qBittorrent Web API to start..."
-          until curl -s http://127.0.0.1:8080/api/v2/app/webapiVersion > /dev/null; do
-            sleep 1
-          done
-          echo "qBittorrent is ready!"
-
-      - name: Add Torrent to qBittorrent
+      - name: Add Torrent and Wait
         run: |
+          # Give the daemon a moment to start
+          sleep 5
+
           if [ -n "${{ inputs.magnet_link }}" ]; then
-            echo "Adding magnet link..."
-            curl -s -X POST \
-              -F "urls=${{ inputs.magnet_link }}" \
-              -F "savepath=${{ github.workspace }}/downloads" \
-              http://127.0.0.1:8080/api/v2/torrents/add
-          
+            echo "Using magnet link..."
+            qbittorrent-cli torrent add url "${{ inputs.magnet_link }}"
           elif [ -n "${{ inputs.torrent_url }}" ]; then
-            echo "Downloading and adding .torrent file..."
-            curl -sL -o temp.torrent "${{ inputs.torrent_url }}"
-            curl -s -X POST \
-              -F "torrents=@temp.torrent" \
-              -F "savepath=${{ github.workspace }}/downloads" \
-              http://127.0.0.1:8080/api/v2/torrents/add
+            echo "Using .torrent file URL..."
+            qbittorrent-cli torrent add url "${{ inputs.torrent_url }}"
+          else
+            echo "::error::No magnet link or torrent URL provided. Exiting."
+            exit 1
           fi
-
-      - name: Monitor Download Progress
-        run: |
-          echo "Monitoring download..."
-          sleep 5 # Initial delay for torrent to be processed
           
+          echo "Waiting for download to complete..."
           while true; do
-            RESPONSE=$(curl -s http://127.0.0.1:8080/api/v2/torrents/info)
-            if ! echo "$RESPONSE" | jq . >/dev/null 2>&1 || [[ "$(echo "$RESPONSE" | jq 'length')" -eq 0 ]]; then
-               echo "Waiting for torrent metadata..."
-               sleep 3; continue
+            # Get the number of active (downloading/seeding) torrents
+            ACTIVE_COUNT=$(qbittorrent-cli torrent list | grep -E 'downloading|seeding|stalledUP' | wc -l)
+            if [ "$ACTIVE_COUNT" -eq 0 ]; then
+              echo "Download appears to be complete."
+              break
             fi
-
-            STATE=$(echo "$RESPONSE" | jq -r '.[0].state')
-            PROGRESS=$(echo "$RESPONSE" | jq -r '.[0].progress')
-            DLSPEED=$(echo "$RESPONSE" | jq -r '.[0].dlspeed')
-            SEEDS=$(echo "$RESPONSE" | jq -r '.[0].num_seeds')
-            PEERS=$(echo "$RESPONSE" | jq -r '.[0].num_leechs')
-            
-            PROG_PERCENT=$(awk "BEGIN {printf \"%.2f\", $PROGRESS * 100}")
-            SPEED_MB=$(awk "BEGIN {printf \"%.2f\", $DLSPEED / 1048576}")
-            
-            echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s | Seeds: $SEEDS | Peers: $PEERS"
-            
-            if [[ "$STATE" == "pausedUP" || "$STATE" == "uploading" || "$PROG_PERCENT" == "100.00" ]]; then
-              echo "Download Completed!"
-              sleep 10; break
-            fi
-            sleep 5
+            echo "Still downloading... ($ACTIVE_COUNT torrents active). Waiting 30 seconds."
+            qbittorrent-cli torrent list # Print status
+            sleep 30
           done
 
       - name: Stop qBittorrent
-        run: pkill qbittorrent-nox && sleep 5
+        run: |
+          killall qbittorrent-nox
+          echo "qBittorrent stopped."
 
       - name: Process and Compress Files
         run: |
           mkdir -p release_upload
           ARCHIVE_NAME="torrent-download-${{ github.run_id }}"
           
-          echo "Processing compression mode: ${{ inputs.compression }}"
-          
-          cd downloads
-          # Check if there are any files to process
-          if [ -z "$(ls -A .)" ]; then
-            echo "::error::Downloaded folder is empty. Nothing to compress or upload."
+          # Check if the download directory is empty before proceeding
+          if [ -z "$(ls -A downloads)" ]; then
+            echo "::error::The 'downloads' directory is empty. Nothing to upload."
             exit 1
           fi
+          
+          echo "Processing compression mode: ${{ inputs.compression }}"
 
           if [ "${{ inputs.compression }}" = "none" ]; then
             echo "No compression selected. Moving files."
-            # If single item, move it. If multiple, move all.
-            mv * ../release_upload/
+            # Move the *contents* of the downloads folder into release_upload
+            mv downloads/* release_upload/
           
-          elif [ "${{ inputs.compression }}" = "zip" ]; then
+          elif [ "${{ inputs.compression }}" = "zip" ];then
             echo "Compressing to ZIP..."
-            zip -r "../release_upload/${ARCHIVE_NAME}.zip" .
+            # Use a subshell to cd, so it doesn't affect the script's main working directory
+            (cd downloads && zip -r "../release_upload/${ARCHIVE_NAME}.zip" .)
           
           elif [ "${{ inputs.compression }}" = "tar" ]; then
             echo "Compressing to TAR..."
-            tar -cvf "../release_upload/${ARCHIVE_NAME}.tar" .
+            # Use -C flag to specify the source directory. This is the cleanest method.
+            tar -cvf "release_upload/${ARCHIVE_NAME}.tar" -C downloads .
           
           elif [ "${{ inputs.compression }}" = "tar.gz" ]; then
             echo "Compressing to TAR.GZ..."
-            tar -czvf "../release_upload/${ARCHIVE_NAME}.tar.gz" .
+            tar -czvf "release_upload/${ARCHIVE_NAME}.tar.gz" -C downloads .
           
           elif [ "${{ inputs.compression }}" = "rar" ]; then
             echo "Compressing to RAR..."
+            # Use a subshell here as well for safety
             if [ -n "${{ inputs.rar_split_size }}" ]; then
               echo "Splitting RAR into volumes of size: ${{ inputs.rar_split_size }}"
-              rar a -v"${{ inputs.rar_split_size }}" "../release_upload/${ARCHIVE_NAME}.rar" .
+              (cd downloads && rar a -v"${{ inputs.rar_split_size }}" "../release_upload/${ARCHIVE_NAME}.rar" .)
             else
               echo "Creating single RAR file..."
-              rar a "../release_upload/${ARCHIVE_NAME}.rar" .
+              (cd downloads && rar a "../release_upload/${ARCHIVE_NAME}.rar" .)
             fi
           fi
-          cd ..
 
       - name: Create Release and Upload Files
         uses: softprops/action-gh-release@v2

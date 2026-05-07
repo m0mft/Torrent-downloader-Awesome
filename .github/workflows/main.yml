@@ -12,7 +12,7 @@ on:
       compression:
         description: 'Compression format'
         required: true
-        default: 'zip'
+        default: 'none'
         type: choice
         options:
           - none
@@ -42,7 +42,8 @@ jobs:
       - name: Start qBittorrent
         run: |
           mkdir -p downloads
-          qbittorrent-nox --daemon --webui-port=8080 --preferences=save_path=$(pwd)/downloads
+          # Corrected the command-line argument for the save path
+          qbittorrent-nox --daemon --webui-port=8080 --save-path=$(pwd)/downloads
 
       - name: Add Torrent and Wait
         run: |
@@ -83,7 +84,6 @@ jobs:
           mkdir -p release_upload
           ARCHIVE_NAME="torrent-download-${{ github.run_id }}"
           
-          # Check if the download directory is empty before proceeding
           if [ -z "$(ls -A downloads)" ]; then
             echo "::error::The 'downloads' directory is empty. Nothing to upload."
             exit 1
@@ -93,17 +93,14 @@ jobs:
 
           if [ "${{ inputs.compression }}" = "none" ]; then
             echo "No compression selected. Moving files."
-            # Move the *contents* of the downloads folder into release_upload
             mv downloads/* release_upload/
           
           elif [ "${{ inputs.compression }}" = "zip" ];then
             echo "Compressing to ZIP..."
-            # Use a subshell to cd, so it doesn't affect the script's main working directory
             (cd downloads && zip -r "../release_upload/${ARCHIVE_NAME}.zip" .)
           
           elif [ "${{ inputs.compression }}" = "tar" ]; then
             echo "Compressing to TAR..."
-            # Use -C flag to specify the source directory. This is the cleanest method.
             tar -cvf "release_upload/${ARCHIVE_NAME}.tar" -C downloads .
           
           elif [ "${{ inputs.compression }}" = "tar.gz" ]; then
@@ -112,7 +109,6 @@ jobs:
           
           elif [ "${{ inputs.compression }}" = "rar" ]; then
             echo "Compressing to RAR..."
-            # Use a subshell here as well for safety
             if [ -n "${{ inputs.rar_split_size }}" ]; then
               echo "Splitting RAR into volumes of size: ${{ inputs.rar_split_size }}"
               (cd downloads && rar a -v"${{ inputs.rar_split_size }}" "../release_upload/${ARCHIVE_NAME}.rar" .)

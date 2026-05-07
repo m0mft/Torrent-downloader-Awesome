@@ -22,7 +22,7 @@ on:
           - tar
           - tar.gz
           - rar
-        default: 'rar'
+        default: 'none'
       rar_split_size:
         description: 'RAR Split Size (e.g., 1900M, 1G). Leave empty for single part.'
         required: false
@@ -55,11 +55,20 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
+          
+      - name: OS-Level Network Tuning
+        run: |
+          # Boost network performance for faster torrenting
+          sudo sysctl -w net.core.rmem_max=2500000
+          sudo sysctl -w net.core.wmem_max=2500000
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 2500000"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 2500000"
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          # Install qBittorrent daemon, jq for API parsing, and rar for compression
           sudo apt-get install -y qbittorrent-nox jq rar
 
       - name: Configure and Start qBittorrent
@@ -67,8 +76,6 @@ jobs:
           mkdir -p ~/.config/qBittorrent
           mkdir -p ${{ github.workspace }}/downloads
 
-          # Configure qBittorrent via its config file
-          # This is more reliable than command-line arguments
           cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
           [Preferences]
           WebUI\LocalHostAuth=false
@@ -77,11 +84,12 @@ jobs:
           Session\GlobalMaxSeedingMinutes=1
           EOF
 
-          # Run qBittorrent in the background (daemonize)
           qbittorrent-nox -d
           
           echo "Waiting for qBittorrent Web API to become active..."
+          sleep 5
           until curl -s http://127.0.0.1:8080/api/v2/app/webapiVersion > /dev/null; do
+            echo -n "."
             sleep 1
           done
           echo "qBittorrent is ready!"
@@ -90,35 +98,26 @@ jobs:
         run: |
           if [ -n "${{ inputs.magnet_link }}" ]; then
             echo "Adding magnet link..."
-            curl -s -X POST \
-              --form-string "urls=${{ inputs.magnet_link }}" \
-              --form-string "savepath=${{ github.workspace }}/downloads" \
-              http://127.0.0.1:8080/api/v2/torrents/add
-          
+            curl -s -X POST --form-string "urls=${{ inputs.magnet_link }}" --form-string "savepath=${{ github.workspace }}/downloads" http://127.0.0.1:8080/api/v2/torrents/add
           elif [ -n "${{ inputs.torrent_url }}" ]; then
             echo "Downloading and adding .torrent file..."
             curl -sL -o temp.torrent "${{ inputs.torrent_url }}"
-            curl -s -X POST \
-              -F "torrents=@temp.torrent" \
-              -F "savepath=${{ github.workspace }}/downloads" \
-              http://127.0.0.1:8080/api/v2/torrents/add
+            curl -s -X POST -F "torrents=@temp.torrent" -F "savepath=${{ github.workspace }}/downloads" http://127.0.0.1:8080/api/v2/torrents/add
           fi
 
       - name: Monitor Download Progress via Web API
         run: |
           echo "Monitoring download..."
-          sleep 5 # Initial delay for torrent to be processed
+          sleep 5 
           
           while true; do
             RESPONSE=$(curl -s http://127.0.0.1:8080/api/v2/torrents/info)
-            # Check if torrent info is available yet
             if ! echo "$RESPONSE" | jq . >/dev/null 2>&1 || [[ "$(echo "$RESPONSE" | jq 'length')" -eq 0 ]]; then
                echo "Waiting for torrent metadata..."
                sleep 5
                continue
             fi
 
-            # Extract details using jq
             STATE=$(echo "$RESPONSE" | jq -r '.[0].state')
             PROGRESS=$(echo "$RESPONSE" | jq -r '.[0].progress')
             DLSPEED=$(echo "$RESPONSE" | jq -r '.[0].dlspeed')
@@ -128,7 +127,6 @@ jobs:
             
             echo "State: $STATE | Progress: $PROG_PERCENT% | Speed: $SPEED_MB MB/s"
             
-            # Exit loop once download is finished and it enters a seeding or completed state
             if [[ "$STATE" == "pausedUP" || "$STATE" == "uploading" || "$PROG_PERCENT" == "100.00" ]]; then
               echo "Download Completed!"
               break
@@ -144,42 +142,56 @@ jobs:
 
       - name: Process and Compress Files
         run: |
-          mkdir -p release_upload
-          ARCHIVE_NAME="torrent-download-${{ github.run_id }}"
-          
+          # Exit immediately if a command exits with a non-zero status.
+          set -e
+
+          echo "--- Content of downloads directory before processing ---"
+          ls -lR downloads
+          echo "--------------------------------------------------------"
+
           if [ -z "$(ls -A downloads)" ]; then
-            echo "::error::The 'downloads' directory is empty. Nothing to upload."
+            echo "::error::The 'downloads' directory is empty. Nothing to process."
             exit 1
           fi
+
+          mkdir -p release_upload
           
-          echo "Processing compression mode: ${{ inputs.compression }}"
+          # Try to get the actual name of the downloaded content for a better archive name
+          CONTENT_NAME=$(ls -A downloads | head -n 1)
+          SANITIZED_NAME=$(echo "$CONTENT_NAME" | tr -c 'a-zA-Z0-9._-' '_')
+          
+          if [ $(ls -A downloads | wc -l) -gt 1 ]; then
+            ARCHIVE_NAME="torrent-collection-${{ github.run_id }}"
+          else
+            ARCHIVE_NAME="${SANITIZED_NAME}"
+          fi
+
+          echo "Final archive base name will be: ${ARCHIVE_NAME}"
 
           if [ "${{ inputs.compression }}" = "none" ]; then
             echo "No compression selected. Moving files."
             mv downloads/* release_upload/
-          
-          elif [ "${{ inputs.compression }}" = "zip" ];then
+          elif [ "${{ inputs.compression }}" = "zip" ]; then
             echo "Compressing to ZIP..."
             (cd downloads && zip -r "../release_upload/${ARCHIVE_NAME}.zip" .)
-          
           elif [ "${{ inputs.compression }}" = "tar" ]; then
             echo "Compressing to TAR..."
-            tar -cvf "release_upload/${ARCHIVE_NAME}.tar" -C downloads .
-          
+            (cd downloads && tar -cvf "../release_upload/${ARCHIVE_NAME}.tar" .)
           elif [ "${{ inputs.compression }}" = "tar.gz" ]; then
             echo "Compressing to TAR.GZ..."
-            tar -czvf "release_upload/${ARCHIVE_NAME}.tar.gz" -C downloads .
-          
+            (cd downloads && tar -czvf "../release_upload/${ARCHIVE_NAME}.tar.gz" .)
           elif [ "${{ inputs.compression }}" = "rar" ]; then
             echo "Compressing to RAR..."
             if [ -n "${{ inputs.rar_split_size }}" ]; then
-              echo "Splitting RAR into volumes of size: ${{ inputs.rar_split_size }}"
               (cd downloads && rar a -v"${{ inputs.rar_split_size }}" "../release_upload/${ARCHIVE_NAME}.rar" .)
             else
-              echo "Creating single RAR file..."
               (cd downloads && rar a "../release_upload/${ARCHIVE_NAME}.rar" .)
             fi
           fi
+
+          echo "--- Content of release directory after processing ---"
+          ls -lR release_upload
+          echo "-----------------------------------------------------"
 
       - name: Create Release and Upload Files
         uses: softprops/action-gh-release@v2

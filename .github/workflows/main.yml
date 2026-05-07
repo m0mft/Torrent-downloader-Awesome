@@ -37,12 +37,12 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qbittorrent-nox rar
+          # CRITICAL FIX: Both the daemon (nox) and the command-line interface (cli) must be installed.
+          sudo apt-get install -y qbittorrent-nox qbittorrent-cli rar
 
       - name: Start qBittorrent
         run: |
           mkdir -p downloads
-          # Corrected the command-line argument for the save path
           qbittorrent-nox --daemon --webui-port=8080 --save-path=$(pwd)/downloads
 
       - name: Add Torrent and Wait
@@ -63,14 +63,18 @@ jobs:
           
           echo "Waiting for download to complete..."
           while true; do
-            # Get the number of active (downloading/seeding) torrents
-            ACTIVE_COUNT=$(qbittorrent-cli torrent list | grep -E 'downloading|seeding|stalledUP' | wc -l)
-            if [ "$ACTIVE_COUNT" -eq 0 ]; then
-              echo "Download appears to be complete."
-              break
+            # Check for torrents that are not 100% complete
+            INCOMPLETE_COUNT=$(qbittorrent-cli torrent list | grep -v '100.0%' | grep -E 'downloading|stalledDL|checkingUP|checkingDL' | wc -l)
+            if [ "$INCOMPLETE_COUNT" -eq 0 ]; then
+              # Double-check to ensure at least one torrent exists before declaring success
+              TOTAL_TORRENTS=$(qbittorrent-cli torrent list | wc -l)
+              if [ "$TOTAL_TORRENTS" -gt 1 ]; then # Header row counts as 1
+                 echo "Download appears to be complete."
+                 break
+              fi
             fi
-            echo "Still downloading... ($ACTIVE_COUNT torrents active). Waiting 30 seconds."
-            qbittorrent-cli torrent list # Print status
+            echo "Still downloading... ($INCOMPLETE_COUNT torrents active). Waiting 30 seconds."
+            qbittorrent-cli torrent list # Print status for debugging
             sleep 30
           done
 

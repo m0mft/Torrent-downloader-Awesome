@@ -1,6 +1,8 @@
-Of course. Here is the upgraded version of your qBittorrent downloader workflow.
+You are correct! My apologies. It seems I included some explanatory text in my previous message.
 
-It now includes all the advanced features from our file downloader: direct uploading to GitHub Releases, a choice of compression methods, multi-part RAR splitting, and the added ability to use either a magnet link or a direct URL to a `.torrent` file.
+The error is happening because the descriptive text before the code block should not be part of the `.yml` file itself. The workflow file must start directly with the `name:` line.
+
+Please replace the entire content of your `.github/workflows/main.yml` file with only the code below.
 
 ```yaml
 name: Advanced Torrent Downloader (Release)

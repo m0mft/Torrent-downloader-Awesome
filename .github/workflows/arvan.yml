@@ -29,7 +29,7 @@ on:
           - github
           - arvancloud
           - both
-        default: 'arvancloud'
+        default: 'both'
 
 jobs:
   download-compress-upload:
@@ -39,23 +39,78 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies (aria2, rar, zip, awscli)
+      - name: Install Dependencies (qBittorrent, rar, zip, awscli, jq)
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 rar zip unzip curl
+          sudo apt-get install -y qbittorrent-nox rar zip unzip curl jq
           
-          # Install AWS CLI v2 officially to avoid apt repository issues on Ubuntu 24.04
+          # Install AWS CLI v2 officially to avoid apt repository issues
           echo "Installing official AWS CLI v2..."
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip -q awscliv2.zip
           sudo ./aws/install --update
-          aws --version
 
-      - name: Download Torrent
+      - name: Setup and Start qBittorrent
         run: |
-          echo "Starting download..."
-          mkdir downloads
-          aria2c --dir=downloads --seed-time=0 "${{ inputs.magnet_link }}"
+          echo "Configuring qBittorrent..."
+          # Accept EULA and disable localhost auth for CI automation
+          mkdir -p ~/.config/qBittorrent
+          cat <<EOF > ~/.config/qBittorrent/qBittorrent.conf
+          [LegalNotice]
+          Accepted=true
+          [Preferences]
+          WebUI\Port=8080
+          WebUI\LocalHostAuth=false
+          EOF
+          
+          echo "Starting qBittorrent daemon..."
+          qbittorrent-nox -d
+          
+          # Wait for WebUI to initialize
+          sleep 5
+
+      - name: Download Torrent via qBittorrent API
+        run: |
+          mkdir -p downloads
+          DOWNLOAD_DIR=$(pwd)/downloads
+          
+          echo "Adding torrent via API..."
+          curl -s -d "urls=${{ inputs.magnet_link }}" -d "savepath=$DOWNLOAD_DIR" "http://localhost:8080/api/v2/torrents/add"
+          
+          echo "Monitoring download progress..."
+          while true; do
+            response=$(curl -s "http://localhost:8080/api/v2/torrents/info")
+            
+            # Check if torrent metadata is loaded
+            if [ "$response" == "[]" ]; then
+              echo "Waiting for metadata..."
+              sleep 5
+              continue
+            fi
+            
+            # Extract state and progress using jq
+            state=$(echo "$response" | jq -r '.[0].state')
+            progress=$(echo "$response" | jq -r '.[0].progress')
+            
+            # Format progress to percentage
+            percent=$(awk "BEGIN { printf \"%.2f\", $progress * 100 }")
+            echo "State: $state - Progress: ${percent}%"
+            
+            # Break conditions: downloading is finished (shifts to seeding/upload states)
+            if [[ "$state" == "pausedUP" || "$state" == "uploading" || "$state" == "stalledUP" || "$state" == "forcedUP" || "$progress" == "1" ]]; then
+              echo "Download completed!"
+              break
+            fi
+            
+            # Error handling
+            if [[ "$state" == "error" || "$state" == "missingFiles" ]]; then
+              echo "Error during download. State: $state"
+              exit 1
+            fi
+            
+            # Wait 10 seconds before polling again
+            sleep 10
+          done
           
           echo "Download complete. Listing files:"
           ls -laR downloads/
@@ -67,7 +122,6 @@ jobs:
           cd downloads
           
           if [ "${{ inputs.compression_format }}" == "rar" ]; then
-            # Using -r to recursively include all files in subdirectories
             if [ "${{ inputs.split_size }}" == "0" ]; then
               rar a -r ../release-archive.rar *
             else
@@ -78,8 +132,6 @@ jobs:
           fi
           
           cd ..
-          echo "Compression complete. Listing archive(s):"
-          ls -la | grep release-archive
 
       - name: Upload to GitHub Releases
         if: ${{ inputs.upload_destination == 'github' || inputs.upload_destination == 'both' }}
@@ -91,10 +143,8 @@ jobs:
           gh release create "$tag_name" --title "Download $tag_name" --notes "Automated download from workflow"
           
           if [ "${{ inputs.compression_format }}" == "none" ]; then
-            # Upload individual files if no compression
             find downloads/ -type f -exec gh release upload "$tag_name" {} +
           else
-            # Upload the generated archive(s)
             gh release upload "$tag_name" release-archive.*
           fi
 
@@ -103,17 +153,15 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.ARVAN_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1 # Dummy region required by awscli
+          AWS_DEFAULT_REGION: us-east-1
           ARVAN_ENDPOINT: https://s3.ir-thr-at1.arvanstorage.ir
           ARVAN_BUCKET: ${{ secrets.ARVAN_BUCKET_NAME }}
         run: |
           echo "Uploading to ArvanCloud S3..."
           
           if [ "${{ inputs.compression_format }}" == "none" ]; then
-            # Upload uncompressed directory recursively
             aws s3 cp downloads/ s3://$ARVAN_BUCKET/downloads/ --recursive --endpoint-url $ARVAN_ENDPOINT
           else
-            # Upload compressed files
             for file in release-archive.*; do
               if [ -e "$file" ]; then
                 aws s3 cp "$file" s3://$ARVAN_BUCKET/ --endpoint-url $ARVAN_ENDPOINT

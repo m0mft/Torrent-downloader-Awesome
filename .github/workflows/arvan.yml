@@ -1,77 +1,101 @@
-name: Torrent Downloader (Multi-Format & Dual Upload)
+name: Torrent Downloader and Uploader
 
 on:
   workflow_dispatch:
     inputs:
       magnet_link:
-        description: 'Magnet Link or Torrent File URL'
+        description: 'Magnet Link or Torrent URL'
         required: true
         type: string
       compression_format:
         description: 'Compression Format'
         required: true
-        default: 'rar'
         type: choice
-        options:
+        options: 
           - none
           - zip
           - rar
+        default: 'none'
       split_size:
-        description: 'RAR Split Size (e.g., 2000m). Use 0 for single file. (Only applies to RAR)'
-        required: true
-        default: '0'
+        description: 'RAR Split Size (e.g. "2000m", "0" for single file)'
+        required: false
         type: string
+        default: '0'
       upload_destination:
-        description: 'Where to upload the files?'
+        description: 'Upload Destination'
         required: true
-        default: 'both'
         type: choice
-        options:
+        options: 
           - github
           - arvancloud
           - both
+        default: 'arvancloud'
 
 jobs:
   download-compress-upload:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install Dependencies (aria2, rar, zip, awscli)
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 rar zip awscli
+          sudo apt-get install -y aria2 rar zip unzip curl
+          
+          # Install AWS CLI v2 officially to avoid apt repository issues on Ubuntu 24.04
+          echo "Installing official AWS CLI v2..."
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+          aws --version
 
       - name: Download Torrent
-        env:
-          MAGNET: ${{ inputs.magnet_link }}
         run: |
-          mkdir -p downloads/
           echo "Starting download..."
-          aria2c --dir=downloads/ --seed-time=0 --max-overall-upload-limit=1K "$MAGNET"
-          echo "Download complete. Contents:"
+          mkdir downloads
+          aria2c --dir=downloads --seed-time=0 "${{ inputs.magnet_link }}"
+          
+          echo "Download complete. Listing files:"
           ls -laR downloads/
 
-      - name: Compress Files (If requested)
-        env:
-          FORMAT: ${{ inputs.compression_format }}
-          SPLIT_SIZE: ${{ inputs.split_size }}
+      - name: Compress Files
+        if: ${{ inputs.compression_format != 'none' }}
         run: |
-          if [ "$FORMAT" == "zip" ]; then
-            echo "Compressing to ZIP..."
-            zip -r release-archive.zip downloads/
-          elif [ "$FORMAT" == "rar" ]; then
-            if [ "$SPLIT_SIZE" == "0" ] || [ -z "$SPLIT_SIZE" ]; then
-              echo "Compressing to a single RAR..."
-              rar a -r release-archive.rar downloads/
+          echo "Starting compression: ${{ inputs.compression_format }}"
+          cd downloads
+          
+          if [ "${{ inputs.compression_format }}" == "rar" ]; then
+            # Using -r to recursively include all files in subdirectories
+            if [ "${{ inputs.split_size }}" == "0" ]; then
+              rar a -r ../release-archive.rar *
             else
-              echo "Compressing to split RAR parts (${SPLIT_SIZE})..."
-              rar a -r -v${SPLIT_SIZE} release-archive.rar downloads/
+              rar a -r -v${{ inputs.split_size }} ../release-archive.rar *
             fi
+          elif [ "${{ inputs.compression_format }}" == "zip" ]; then
+            zip -r ../release-archive.zip *
+          fi
+          
+          cd ..
+          echo "Compression complete. Listing archive(s):"
+          ls -la | grep release-archive
+
+      - name: Upload to GitHub Releases
+        if: ${{ inputs.upload_destination == 'github' || inputs.upload_destination == 'both' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Uploading to GitHub Releases..."
+          tag_name="release-$(date +%s)"
+          gh release create "$tag_name" --title "Download $tag_name" --notes "Automated download from workflow"
+          
+          if [ "${{ inputs.compression_format }}" == "none" ]; then
+            # Upload individual files if no compression
+            find downloads/ -type f -exec gh release upload "$tag_name" {} +
           else
-            echo "Skipping compression. Files will be uploaded as-is."
+            # Upload the generated archive(s)
+            gh release upload "$tag_name" release-archive.*
           fi
 
       - name: Upload to ArvanCloud S3
@@ -79,34 +103,20 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.ARVAN_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1 # Dummy region required by awscli
           ARVAN_ENDPOINT: https://s3.ir-thr-at1.arvanstorage.ir
           ARVAN_BUCKET: ${{ secrets.ARVAN_BUCKET_NAME }}
-          FORMAT: ${{ inputs.compression_format }}
         run: |
           echo "Uploading to ArvanCloud S3..."
-          if [ "$FORMAT" == "none" ]; then
-            # Upload the entire directory recursively if no compression
-            aws s3 cp downloads/ s3://$ARVAN_BUCKET/ --recursive --endpoint-url $ARVAN_ENDPOINT
-          else
-            # Upload generated zip/rar files
-            for file in release-archive.*; do
-              aws s3 cp "$file" s3://$ARVAN_BUCKET/ --endpoint-url $ARVAN_ENDPOINT
-            done
-          fi
-
-      - name: Create GitHub Release and Upload
-        if: ${{ inputs.upload_destination == 'github' || inputs.upload_destination == 'both' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORMAT: ${{ inputs.compression_format }}
-        run: |
-          TAG_NAME="release-$(date +'%Y%m%d%H%M%S')"
-          echo "Creating GitHub Release $TAG_NAME..."
           
-          if [ "$FORMAT" == "none" ]; then
-            # GitHub Releases need individual files, so we upload everything inside downloads/
-            gh release create "$TAG_NAME" downloads/* --title "Download $TAG_NAME"
+          if [ "${{ inputs.compression_format }}" == "none" ]; then
+            # Upload uncompressed directory recursively
+            aws s3 cp downloads/ s3://$ARVAN_BUCKET/downloads/ --recursive --endpoint-url $ARVAN_ENDPOINT
           else
-            # Upload the generated archive files
-            gh release create "$TAG_NAME" release-archive.* --title "Download $TAG_NAME"
+            # Upload compressed files
+            for file in release-archive.*; do
+              if [ -e "$file" ]; then
+                aws s3 cp "$file" s3://$ARVAN_BUCKET/ --endpoint-url $ARVAN_ENDPOINT
+              fi
+            done
           fi

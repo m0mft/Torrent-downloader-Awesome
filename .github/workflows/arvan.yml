@@ -1,4 +1,4 @@
-name: Torrent Downloader and Uploader
+name: Arvan Torrent Downloader
 
 on:
   workflow_dispatch:
